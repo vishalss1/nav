@@ -1,3 +1,5 @@
 <resources>
-    <string name="app_name">nav</string>
+    <string name="app_name">NaV</string>
+    <string name="accessibility_service_description">NaV uses accessibility services to read the screen and provide navigation guidance.</string>
+    <string name="bubble_content_description">NaV Assistant Bubble</string>
 </resources>
