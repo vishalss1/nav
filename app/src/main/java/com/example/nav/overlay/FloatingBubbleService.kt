@@ -37,6 +37,7 @@ import android.util.Log
 import com.example.nav.R
 import com.example.nav.accessibility.GuideAccessibilityService
 import com.example.nav.llm.LLMService
+import com.example.nav.voice.TTSManager
 import com.example.nav.voice.VoiceInputManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -49,12 +50,14 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
     private var islandView: ComposeView? = null
     private val llmService = LLMService()
     private lateinit var voiceInputManager: VoiceInputManager
+    private lateinit var ttsManager: TTSManager
     private lateinit var systemActionExecutor: SystemActionExecutor
     
     private var isIslandExpanded by mutableStateOf(false)
     private var llmResponse by mutableStateOf<String?>(null)
     private var isThinking by mutableStateOf(false)
     private var isListening by mutableStateOf(false)
+    private var isSpeaking by mutableStateOf(false)
     private var voiceTranscript by mutableStateOf("")
     private var rmsLevel by mutableStateOf(0f)
 
@@ -81,6 +84,9 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         voiceInputManager = VoiceInputManager(this)
         systemActionExecutor = SystemActionExecutor(this)
+        ttsManager = TTSManager(this) { success ->
+            if (success) Log.d(TAG, "TTS ready in Service")
+        }
         startAsForeground()
         showIsland()
     }
@@ -109,6 +115,7 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
                         onDismiss = { 
                             isIslandExpanded = false
                             stopVoiceInput()
+                            ttsManager.stop()
                             updateParamsForIsland()
                         },
                         onSend = { intent -> handleUserIntent(intent) },
@@ -169,7 +176,7 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
     }
 
     private fun startVoiceInput() {
-        if (isThinking || isListening || !isIslandExpanded) return
+        if (isThinking || isListening || !isIslandExpanded || isSpeaking) return
         
         isListening = true
         voiceTranscript = ""
@@ -188,17 +195,16 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
                 isListening = false 
                 Log.e(TAG, "Speech Error: $error")
                 
-                // Don't restart if it's already thinking or if the island was closed
-                if (isIslandExpanded && !isThinking) {
+                if (isIslandExpanded && !isThinking && !isSpeaking) {
                     val delayMillis = when(error) {
-                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 1500L // Longer cooldown for busy
-                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 500L   // Quick restart for timeout
-                        SpeechRecognizer.ERROR_NO_MATCH -> 500L        // Quick restart for no match
+                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 1500L
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 500L
+                        SpeechRecognizer.ERROR_NO_MATCH -> 500L
                         else -> 1000L
                     }
                     restartJob = lifecycleScope.launch {
                         delay(delayMillis)
-                        if (isIslandExpanded && !isThinking && !isListening) {
+                        if (isIslandExpanded && !isThinking && !isListening && !isSpeaking) {
                             Log.d(TAG, "Auto-restarting voice input...")
                             startVoiceInput()
                         }
@@ -228,16 +234,19 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
         val screenContext = GuideAccessibilityService.getCurrentContext()
         val prefs = getSharedPreferences("nav_prefs", MODE_PRIVATE)
         val apiKey = prefs.getString("groq_api_key", "") ?: ""
+        val voiceId = prefs.getString("preferred_voice_id", null)
 
         if (apiKey.isBlank()) {
-            llmResponse = "Set Groq API Key in NaV app."
+            val msg = "Set Groq API Key in NaV app."
+            llmResponse = msg
+            ttsManager.speak(msg, voiceId)
             return
         }
 
         isThinking = true
         llmResponse = null
-        // Explicitly stop listening before API call
         stopVoiceInput()
+        ttsManager.stop()
         
         lifecycleScope.launch {
             Log.d(TAG, "Sending to LLM: $intent")
@@ -245,17 +254,26 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
             Log.d(TAG, "LLM Response: $response")
             
             if (response.startsWith("ACTION: OPEN_APP:")) {
-                val appName = response.substringAfter("OPEN_APP:").trim()
-                llmResponse = "Opening $appName..."
-                // Small delay to let user see the message
-                delay(800)
+                val appName = response.substringAfterLast(":").trim()
+                val speakMsg = "Opening $appName..."
+                llmResponse = speakMsg
+                isSpeaking = true
+                ttsManager.speak(speakMsg, voiceId)
+                
+                delay(1500) // Let TTS speak
+                isSpeaking = false
                 systemActionExecutor.execute(response.removePrefix("ACTION:").trim())
                 isIslandExpanded = false
                 updateParamsForIsland()
             } else {
                 llmResponse = response
-                // After response, if island is still expanded, resume listening?
-                // For now, let user manual trigger or we can auto-resume if requested
+                isSpeaking = true
+                ttsManager.speak(response, voiceId)
+                // We'd need a callback from TTS to reset isSpeaking properly
+                // For now, a rough estimate or we can add a listener to TTSManager
+                delay(5000) 
+                isSpeaking = false
+                if (isIslandExpanded && !isListening) startVoiceInput()
             }
             isThinking = false
         }
@@ -267,5 +285,6 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
         super.onDestroy()
         islandView?.let { windowManager.removeView(it) }
         voiceInputManager.destroy()
+        ttsManager.destroy()
     }
 }

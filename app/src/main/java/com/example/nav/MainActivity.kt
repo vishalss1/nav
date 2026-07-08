@@ -21,16 +21,37 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.nav.overlay.FloatingBubbleService
+import com.example.nav.voice.TTSManager
+import com.example.nav.voice.VoiceInfo
 
 class MainActivity : ComponentActivity() {
 
+    private var ttsManager: TTSManager? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     var apiKey by remember { mutableStateOf(getSavedApiKey()) }
+                    var selectedVoiceId by remember { mutableStateOf(getSavedVoiceId()) }
                     val context = LocalContext.current
+                    
+                    var availableVoices by remember { mutableStateOf(emptyList<VoiceInfo>()) }
+                    
+                    // Initialize TTS to get voices
+                    DisposableEffect(Unit) {
+                        ttsManager = TTSManager(context) { success ->
+                            if (success) {
+                                availableVoices = ttsManager?.getAvailableVoices() ?: emptyList()
+                            }
+                        }
+                        onDispose {
+                            ttsManager?.destroy()
+                        }
+                    }
+
                     var hasMicPermission by remember { 
                         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
                     }
@@ -46,6 +67,13 @@ class MainActivity : ComponentActivity() {
                         onApiKeyChange = { 
                             apiKey = it
                             saveApiKey(it)
+                        },
+                        availableVoices = availableVoices,
+                        selectedVoiceId = selectedVoiceId,
+                        onVoiceChange = {
+                            selectedVoiceId = it
+                            saveVoiceId(it)
+                            ttsManager?.speak("This is a sample of the selected voice", it)
                         },
                         hasMicPermission = hasMicPermission,
                         onGrantMic = { micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
@@ -74,6 +102,16 @@ class MainActivity : ComponentActivity() {
         prefs.edit().putString("groq_api_key", key).apply()
     }
 
+    private fun getSavedVoiceId(): String {
+        val prefs = getSharedPreferences("nav_prefs", MODE_PRIVATE)
+        return prefs.getString("preferred_voice_id", "") ?: ""
+    }
+
+    private fun saveVoiceId(voiceId: String) {
+        val prefs = getSharedPreferences("nav_prefs", MODE_PRIVATE)
+        prefs.edit().putString("preferred_voice_id", voiceId).apply()
+    }
+
     private fun requestOverlayPermission() {
         val intent = Intent(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -95,10 +133,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OnboardingScreen(
     apiKey: String,
     onApiKeyChange: (String) -> Unit,
+    availableVoices: List<VoiceInfo>,
+    selectedVoiceId: String,
+    onVoiceChange: (String) -> Unit,
     hasMicPermission: Boolean,
     onGrantMic: () -> Unit,
     onGrantOverlay: () -> Unit,
@@ -112,10 +154,10 @@ fun OnboardingScreen(
             .padding(16.dp)
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Top
     ) {
         Text("Welcome to NaV", style = MaterialTheme.typography.headlineMedium)
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
         OutlinedTextField(
             value = apiKey,
@@ -124,6 +166,43 @@ fun OnboardingScreen(
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
         )
+        
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Voice Selection Dropdown
+        var expanded by remember { mutableStateOf(false) }
+        val currentVoiceName = availableVoices.find { it.id == selectedVoiceId }?.displayName ?: "Select Voice"
+
+        ExposedDropdownMenuBox(
+            expanded = expanded,
+            onExpandedChange = { expanded = !expanded },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            OutlinedTextField(
+                value = currentVoiceName,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("Assistant Voice") },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier.menuAnchor().fillMaxWidth()
+            )
+
+            ExposedDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false }
+            ) {
+                availableVoices.forEach { voice ->
+                    DropdownMenuItem(
+                        text = { Text(voice.displayName) },
+                        onClick = {
+                            onVoiceChange(voice.id)
+                            expanded = false
+                        }
+                    )
+                }
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
         
         Text("NaV needs these permissions:", style = MaterialTheme.typography.bodyLarge)
