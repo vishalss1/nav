@@ -4,53 +4,61 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import android.content.Intent
 import android.graphics.PixelFormat
-import android.os.Build
+import android.os.Bundle
 import android.view.Gravity
 import android.view.WindowManager
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.offset
-import androidx.compose.runtime.remember
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import android.speech.SpeechRecognizer
+import android.util.Log
 import com.example.nav.R
-import kotlin.math.roundToInt
-
-import androidx.compose.foundation.clickable
-import androidx.lifecycle.lifecycleScope
 import com.example.nav.accessibility.GuideAccessibilityService
 import com.example.nav.llm.LLMService
+import com.example.nav.voice.VoiceInputManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
 
+    private val TAG = "FloatingBubbleService"
     private lateinit var windowManager: WindowManager
-    private var bubbleView: ComposeView? = null
+    private var islandView: ComposeView? = null
     private val llmService = LLMService()
+    private lateinit var voiceInputManager: VoiceInputManager
+    private lateinit var systemActionExecutor: SystemActionExecutor
     
-    private var isPanelExpanded by mutableStateOf(false)
+    private var isIslandExpanded by mutableStateOf(false)
     private var llmResponse by mutableStateOf<String?>(null)
     private var isThinking by mutableStateOf(false)
+    private var isListening by mutableStateOf(false)
+    private var voiceTranscript by mutableStateOf("")
+    private var rmsLevel by mutableStateOf(0f)
+
+    private var restartJob: Job? = null
 
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
     override val savedStateRegistry: SavedStateRegistry
@@ -60,142 +68,204 @@ class FloatingBubbleService : LifecycleService(), SavedStateRegistryOwner {
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
         PixelFormat.TRANSLUCENT
     ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        x = 0
-        y = 100
-    }
-
-    private var panelParams = WindowManager.LayoutParams(
-        WindowManager.LayoutParams.MATCH_PARENT,
-        WindowManager.LayoutParams.WRAP_CONTENT,
-        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
-        PixelFormat.TRANSLUCENT
-    ).apply {
-        gravity = Gravity.CENTER
+        gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        y = 40
     }
 
     override fun onCreate() {
         super.onCreate()
         savedStateRegistryController.performRestore(null)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        voiceInputManager = VoiceInputManager(this)
+        systemActionExecutor = SystemActionExecutor(this)
         startAsForeground()
-        showBubble()
+        showIsland()
     }
 
     private fun startAsForeground() {
-        val channelId = "floating_bubble_service"
-        val channel = NotificationChannel(
-            channelId,
-            "Floating Bubble Service",
-            NotificationManager.IMPORTANCE_LOW
-        )
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-            .createNotificationChannel(channel)
+        val channelId = "nav_island_service"
+        val channel = NotificationChannel(channelId, "NaV", NotificationManager.IMPORTANCE_LOW)
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
 
         val notification = Notification.Builder(this, channelId)
             .setContentTitle("NaV Assistant")
-            .setContentText("NaV is running")
             .setSmallIcon(R.mipmap.ic_launcher)
             .build()
-
         startForeground(1, notification)
     }
 
-    private fun showBubble() {
-        bubbleView = ComposeView(this).apply {
+    private fun showIsland() {
+        islandView = ComposeView(this).apply {
             setViewTreeLifecycleOwner(this@FloatingBubbleService)
             setViewTreeSavedStateRegistryOwner(this@FloatingBubbleService)
             
             setContent {
-                var offsetX by remember { mutableStateOf(0f) }
-                var offsetY by remember { mutableStateOf(100f) }
-
-                if (isPanelExpanded) {
+                if (isIslandExpanded) {
                     updateParamsForPanel()
                     AssistantPanel(
                         onDismiss = { 
-                            isPanelExpanded = false
-                            updateParamsForBubble()
+                            isIslandExpanded = false
+                            stopVoiceInput()
+                            updateParamsForIsland()
                         },
-                        onSend = { intent ->
-                            handleUserIntent(intent)
-                        },
+                        onSend = { intent -> handleUserIntent(intent) },
+                        onStartVoice = { startVoiceInput() },
+                        onStopVoice = { stopVoiceInput() },
                         response = llmResponse,
-                        isThinking = isThinking
+                        isThinking = isThinking,
+                        isListening = isListening,
+                        voiceTranscript = voiceTranscript,
+                        rmsLevel = rmsLevel
                     )
                 } else {
                     Box(
                         modifier = Modifier
-                            .offset { IntOffset(offsetX.roundToInt(), offsetY.roundToInt()) }
-                            .size(60.dp)
-                            .background(Color.Blue, CircleShape)
-                            .clickable { isPanelExpanded = true }
-                            .pointerInput(Unit) {
-                                detectDragGestures { change, dragAmount ->
-                                    change.consume()
-                                    offsetX += dragAmount.x
-                                    offsetY += dragAmount.y
-                                    
-                                    params.x = offsetX.roundToInt()
-                                    params.y = offsetY.roundToInt()
-                                    windowManager.updateViewLayout(bubbleView, params)
-                                }
-                            },
+                            .widthIn(min = 100.dp)
+                            .height(38.dp)
+                            .clip(RoundedCornerShape(19.dp))
+                            .background(Color.Black)
+                            .clickable { 
+                                isIslandExpanded = true 
+                                startVoiceInput()
+                            }
+                            .animateContentSize(spring(Spring.DampingRatioLowBouncy, Spring.StiffnessLow)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("NaV", color = Color.White)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 16.dp)
+                        ) {
+                            if (isThinking) {
+                                Box(modifier = Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(Color.Yellow))
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+                            Text(
+                                text = if (isThinking) "NaV..." else "NaV", 
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
             }
         }
-
-        windowManager.addView(bubbleView, params)
+        windowManager.addView(islandView, params)
     }
 
     private fun updateParamsForPanel() {
         params.width = WindowManager.LayoutParams.MATCH_PARENT
-        params.height = WindowManager.LayoutParams.WRAP_CONTENT
-        params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
-        windowManager.updateViewLayout(bubbleView, params)
+        params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        windowManager.updateViewLayout(islandView, params)
     }
 
-    private fun updateParamsForBubble() {
+    private fun updateParamsForIsland() {
         params.width = WindowManager.LayoutParams.WRAP_CONTENT
-        params.height = WindowManager.LayoutParams.WRAP_CONTENT
-        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        windowManager.updateViewLayout(bubbleView, params)
+        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        windowManager.updateViewLayout(islandView, params)
+    }
+
+    private fun startVoiceInput() {
+        if (isThinking || isListening || !isIslandExpanded) return
+        
+        isListening = true
+        voiceTranscript = ""
+        restartJob?.cancel()
+        
+        voiceInputManager.startListening(listener = object : VoiceInputManager.VoiceListener {
+            override fun onReadyForSpeech() { Log.d(TAG, "Speech Ready") }
+            override fun onBeginningOfSpeech() { Log.d(TAG, "Speech Start") }
+            override fun onRmsChanged(rmsdB: Float) { rmsLevel = rmsdB }
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() { 
+                isListening = false 
+                Log.d(TAG, "Speech End")
+            }
+            override fun onError(error: Int) { 
+                isListening = false 
+                Log.e(TAG, "Speech Error: $error")
+                
+                // Don't restart if it's already thinking or if the island was closed
+                if (isIslandExpanded && !isThinking) {
+                    val delayMillis = when(error) {
+                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 1500L // Longer cooldown for busy
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 500L   // Quick restart for timeout
+                        SpeechRecognizer.ERROR_NO_MATCH -> 500L        // Quick restart for no match
+                        else -> 1000L
+                    }
+                    restartJob = lifecycleScope.launch {
+                        delay(delayMillis)
+                        if (isIslandExpanded && !isThinking && !isListening) {
+                            Log.d(TAG, "Auto-restarting voice input...")
+                            startVoiceInput()
+                        }
+                    }
+                }
+            }
+            override fun onResults(results: String) {
+                isListening = false
+                voiceTranscript = results
+                handleUserIntent(results)
+            }
+            override fun onPartialResults(partialResults: String) {
+                voiceTranscript = partialResults
+            }
+        })
+    }
+
+    private fun stopVoiceInput() {
+        restartJob?.cancel()
+        voiceInputManager.stopListening()
+        isListening = false
     }
 
     private fun handleUserIntent(intent: String) {
+        if (intent.isBlank()) return
+        
         val screenContext = GuideAccessibilityService.getCurrentContext()
-        if (screenContext == null) {
-            llmResponse = "Sorry, I can't read the screen right now. Please make sure Accessibility Service is enabled."
-            return
-        }
-
         val prefs = getSharedPreferences("nav_prefs", MODE_PRIVATE)
         val apiKey = prefs.getString("groq_api_key", "") ?: ""
 
         if (apiKey.isBlank()) {
-            llmResponse = "Please set your Groq API Key in the app first."
+            llmResponse = "Set Groq API Key in NaV app."
             return
         }
 
         isThinking = true
         llmResponse = null
+        // Explicitly stop listening before API call
+        stopVoiceInput()
         
         lifecycleScope.launch {
-            llmResponse = llmService.getNavigationSteps(apiKey, screenContext, intent)
+            Log.d(TAG, "Sending to LLM: $intent")
+            val response = llmService.getNavigationSteps(apiKey, screenContext ?: fallbackContext(), intent)
+            Log.d(TAG, "LLM Response: $response")
+            
+            if (response.startsWith("ACTION: OPEN_APP:")) {
+                val appName = response.substringAfter("OPEN_APP:").trim()
+                llmResponse = "Opening $appName..."
+                // Small delay to let user see the message
+                delay(800)
+                systemActionExecutor.execute(response.removePrefix("ACTION:").trim())
+                isIslandExpanded = false
+                updateParamsForIsland()
+            } else {
+                llmResponse = response
+                // After response, if island is still expanded, resume listening?
+                // For now, let user manual trigger or we can auto-resume if requested
+            }
             isThinking = false
         }
     }
 
+    private fun fallbackContext() = com.example.nav.model.ScreenContext("unknown", "Home", emptyList(), emptyList(), false)
+
     override fun onDestroy() {
         super.onDestroy()
-        bubbleView?.let { windowManager.removeView(it) }
+        islandView?.let { windowManager.removeView(it) }
+        voiceInputManager.destroy()
     }
 }

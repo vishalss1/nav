@@ -1,19 +1,25 @@
 package com.example.nav
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.core.content.ContextCompat
 import com.example.nav.overlay.FloatingBubbleService
 
 class MainActivity : ComponentActivity() {
@@ -24,6 +30,16 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     var apiKey by remember { mutableStateOf(getSavedApiKey()) }
+                    val context = LocalContext.current
+                    var hasMicPermission by remember { 
+                        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                    }
+
+                    val micPermissionLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.RequestPermission()
+                    ) { isGranted ->
+                        hasMicPermission = isGranted
+                    }
                     
                     OnboardingScreen(
                         apiKey = apiKey,
@@ -31,13 +47,21 @@ class MainActivity : ComponentActivity() {
                             apiKey = it
                             saveApiKey(it)
                         },
+                        hasMicPermission = hasMicPermission,
+                        onGrantMic = { micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
                         onGrantOverlay = { requestOverlayPermission() },
                         onGrantAccessibility = { requestAccessibilityPermission() },
+                        onSetDefaultAssistant = { requestDefaultAssistantSetting() },
                         onStartAssistant = { startAssistantService() }
                     )
                 }
             }
         }
+    }
+
+    private fun requestDefaultAssistantSetting() {
+        val intent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+        startActivity(intent)
     }
 
     private fun getSavedApiKey(): String {
@@ -75,8 +99,11 @@ class MainActivity : ComponentActivity() {
 fun OnboardingScreen(
     apiKey: String,
     onApiKeyChange: (String) -> Unit,
+    hasMicPermission: Boolean,
+    onGrantMic: () -> Unit,
     onGrantOverlay: () -> Unit,
     onGrantAccessibility: () -> Unit,
+    onSetDefaultAssistant: () -> Unit,
     onStartAssistant: () -> Unit
 ) {
     Column(
@@ -102,24 +129,56 @@ fun OnboardingScreen(
         Text("NaV needs these permissions:", style = MaterialTheme.typography.bodyLarge)
         Spacer(modifier = Modifier.height(16.dp))
         
-        Button(onClick = onGrantOverlay, modifier = Modifier.fillMaxWidth()) {
+        Button(
+            onClick = onGrantOverlay, 
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+        ) {
             Text("1. Grant Overlay Permission")
         }
         Text("Allows showing the floating bubble on top of other apps.", style = MaterialTheme.typography.bodySmall)
         
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
         
-        Button(onClick = onGrantAccessibility, modifier = Modifier.fillMaxWidth()) {
+        Button(
+            onClick = onGrantAccessibility, 
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+        ) {
             Text("2. Enable Accessibility Service")
         }
         Text("Allows NaV to read the screen context.", style = MaterialTheme.typography.bodySmall)
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Button(
+            onClick = onGrantMic, 
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (hasMicPermission) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+            )
+        ) {
+            Text(if (hasMicPermission) "3. Microphone Granted" else "3. Grant Microphone Permission")
+        }
+        Text("Allows you to talk to the assistant.", style = MaterialTheme.typography.bodySmall)
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Button(
+            onClick = onSetDefaultAssistant, 
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+        ) {
+            Text("4. Set as Default Assistant")
+        }
+        Text("Unlocks background listening for seamless help.", style = MaterialTheme.typography.bodySmall)
         
         Spacer(modifier = Modifier.height(32.dp))
         
         Button(
             onClick = onStartAssistant, 
             modifier = Modifier.fillMaxWidth(),
-            enabled = apiKey.isNotBlank()
+            enabled = apiKey.isNotBlank() && hasMicPermission
         ) {
             Text("Start Assistant")
         }
